@@ -1,0 +1,14 @@
+tensorflow
+pillow
+flask
+flask_cors
+numpy
+qdrant-client
+cloudinary
+load_dotenv
+ollama
+qwen2.5:1.5b
+//
+ultralytics
+transformers
+cloudinary
