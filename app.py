@@ -18,6 +18,10 @@ import base64
 from flask_cors import CORS
 import io
 import requests
+import json
+from werkzeug.utils import secure_filename
+import uuid
+
 # Initialize CORS
 from dotenv import load_dotenv
 load_dotenv()
@@ -252,7 +256,102 @@ def search_images():
 
     return jsonify({"keywords": keywords, "results": results})
 
+def save_images_to_qdrant(images_data):
+    """
+    Lưu nhiều ảnh vào Qdrant.
+    images_data: list of dicts {"cloud_url": str, "public_id": str}
+    """
+    for data in images_data:
+        cloud_url = data.get("cloud_url")
+        public_id = data.get("public_id")
+        if not cloud_url or not public_id:
+            continue
+        try:
+            response = requests.get(cloud_url)
+            response.raise_for_status()
+            img = Image.open(io.BytesIO(response.content))
 
+            vector = extract_features_from_pil_image(img)
+            if vector is None:
+                logging.warning(f"Không extract được vector cho {public_id}")
+                continue
+
+            # 🔹 Tạo ID duy nhất bằng UUID
+            point_id = str(uuid.uuid4())
+
+            qdrant_request_with_retries(
+                qdrant_client.upsert,
+                collection_name=collection_name,
+                points=[{
+                    "id": point_id,
+                    "vector": vector,
+                    "payload": {
+                        "filename": public_id,
+                        "image_url": cloud_url
+                    }
+                }]
+            )
+            logging.info(f"Đã lưu {public_id} vào Qdrant với id={point_id}.")
+        except Exception as e:
+            logging.error(f"Lỗi khi lưu {public_id} vào Qdrant: {e}")
+
+@app.route("/upload-cloud", methods=["POST"])
+def upload_cloud_multi():
+    """
+    Upload nhiều ảnh lên Cloudinary và lưu vector vào Qdrant.
+    Client gửi form-data với key "files" (có thể nhiều file)
+    và optional "tags_list" (JSON string: [["tag1"], ["tag2"], ...])
+    """
+    files = request.files.getlist("files")
+    tags_str_list = request.form.get("tags_list")  # JSON string
+    tags_list = json.loads(tags_str_list) if tags_str_list else []
+
+    if not files:
+        return jsonify({"error": "Không có file gửi lên!"}), 400
+
+    os.makedirs("temp", exist_ok=True)
+    uploaded_data = []
+
+    for idx, file in enumerate(files):
+        temp_path = None
+        try:
+            filename = secure_filename(file.filename)
+            temp_path = os.path.join("temp", filename)
+            file.save(temp_path)
+
+            # Lấy tags tương ứng
+            tags = tags_list[idx] if idx < len(tags_list) else []
+
+            # Upload Cloudinary
+            upload_result = upload_to_cloudinary(temp_path, tags)
+
+            # Xử lý nếu upload_result là string URL
+            if isinstance(upload_result, str):
+                cloud_url = upload_result
+                public_id = os.path.basename(filename).rsplit(".", 1)[0]
+            elif isinstance(upload_result, dict):
+                cloud_url = upload_result.get("secure_url")
+                public_id = upload_result.get("public_id")
+            else:
+                raise ValueError("upload_to_cloudinary trả về không hợp lệ")
+
+            os.remove(temp_path)
+
+            if cloud_url and public_id:
+                uploaded_data.append({"cloud_url": cloud_url, "public_id": public_id})
+                logging.info(f"Upload thành công {filename}")
+            else:
+                logging.warning(f"Upload thất bại cho {filename}")
+
+        except Exception as e:
+            logging.error(f"Lỗi upload file {file.filename}: {e}")
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    # 🔹 Lưu tất cả ảnh mới vào Qdrant
+    save_images_to_qdrant(uploaded_data)
+
+    return jsonify({"uploaded": uploaded_data, "saved_to_qdrant": len(uploaded_data)})
 
 if __name__ == '__main__':
     app.run(debug=True, port=os.getenv("PORT", default=5000))

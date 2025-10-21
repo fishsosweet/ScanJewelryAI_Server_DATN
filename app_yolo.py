@@ -1,14 +1,17 @@
 from ultralytics import YOLO
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from transformers import CLIPProcessor, CLIPModel
-from PIL import Image
+from PIL import Image, ImageEnhance
+from werkzeug.utils import secure_filename
 import torch
 import tempfile
 import os
+import json
+import uuid
 
 # Import hàm upload từ file khác
-from services.cloudinary_service import upload_to_cloudinary  # đổi tên theo file thật
+from services.cloudinary_service import upload_to_cloudinary
 
 app = Flask(__name__)
 CORS(app)
@@ -37,7 +40,7 @@ except Exception as e:
     clip_model = None
 
 # ====================================
-# 🔹 Ánh xạ tag YOLO sang tiếng Việt có dấu
+# 🔹 Ánh xạ tag YOLO sang tiếng Việt
 # ====================================
 YOLO_TAGS_VI = {
     "Nhan": "nhẫn",
@@ -49,58 +52,87 @@ YOLO_TAGS_VI = {
 }
 
 # ====================================
-# 🔹 Danh sách tag mô tả cho CLIP
+# 🔹 Nhóm tag CLIP (chia theo loại)
 # ====================================
-TAG_CANDIDATES = {
-    "vàng": "gold",
-    "bạc": "silver",
-    "kim cương": "diamond",
-    "ngọc trai": "pearl",
-    "thanh lịch": "elegant",
-    "tối giản": "minimalist"
+TAG_GROUPS = {
+    "chất liệu": {
+        "vàng": "a gold jewelry piece",
+        "bạc": "a silver jewelry piece",
+    },
+    "phong cách": {
+        "tối giản": "a minimalist jewelry design",
+        "thanh lịch": "an elegant jewelry style",
+        "sang trọng": "a luxurious jewelry piece",
+        "cổ điển": "a classic jewelry design",
+        "hiện đại": "a modern jewelry style",
+        "đáng yêu": "a cute jewelry item",
+        "nữ tính": "a feminine jewelry piece",
+        "nam tính": "a masculine jewelry style",
+        "cá tính": "a bold jewelry design",
+        "nghệ thuật": "an artistic jewelry design",
+        "đính đá": "a gemstone jewelry"
+    },
+    "dịp sử dụng": {
+        "đám cưới": "a wedding jewelry",
+        "hẹn hò": "a date jewelry",
+        "dự tiệc": "a party jewelry",
+        "quà tặng": "a gift jewelry",
+        "hằng ngày": "a daily wear jewelry",
+        "sang trọng": "a formal jewelry",
+        "công sở": "an office jewelry",
+        "du lịch": "a travel jewelry"
+    }
 }
 
+# ====================================
+# 🔹 Hàm tăng màu cho CLIP
+# ====================================
+def enhance_image_for_clip(image: Image.Image) -> Image.Image:
+    enhancer = ImageEnhance.Color(image)
+    return enhancer.enhance(1.3)
 
 # ====================================
-# 🔹 Hàm sinh tag bằng CLIP (trả về tiếng Việt)
+# 🔹 Hàm sinh tag bằng CLIP
 # ====================================
-def generate_clip_tags(image):
-    """Sinh tag mô tả bằng CLIP (hiển thị tiếng Việt)"""
-    try:
-        vi_tags = list(TAG_CANDIDATES.keys())
-        en_tags = list(TAG_CANDIDATES.values())
+def generate_clip_tags(image: Image.Image):
+    all_best_tags = []
+    image = enhance_image_for_clip(image)
 
-        inputs = clip_processor(
-            text=en_tags,
-            images=image,
-            return_tensors="pt",
-            padding=True
-        ).to(device)
+    for group_name, tag_dict in TAG_GROUPS.items():
+        try:
+            vi_texts = list(tag_dict.keys())
+            en_prompts = list(tag_dict.values())
 
-        outputs = clip_model(**inputs)
-        logits_per_image = outputs.logits_per_image
-        probs = logits_per_image.softmax(dim=1).cpu().detach().numpy()[0]
+            inputs = clip_processor(
+                text=en_prompts,
+                images=image,
+                return_tensors="pt",
+                padding=True
+            ).to(device)
 
-        top_idx = probs.argsort()[-3:][::-1]
-        top_tags_vi = [vi_tags[i] for i in top_idx]
+            with torch.no_grad():
+                outputs = clip_model(**inputs)
+                probs = outputs.logits_per_image.softmax(dim=1).cpu().numpy()[0]
 
-        print(f"🧠 CLIP tags (vi): {top_tags_vi}")
-        return top_tags_vi
+            best_idx = probs.argmax()
+            best_vi = vi_texts[best_idx]
+            all_best_tags.append(best_vi)
 
-    except Exception as e:
-        print(f"❌ Lỗi sinh tag CLIP: {e}")
-        return []
+            print(f"🎯 CLIP ({group_name}): {best_vi} ({probs[best_idx]:.2f})")
+
+        except Exception as e:
+            print(f"❌ Lỗi sinh tag CLIP cho nhóm {group_name}: {e}")
+
+    return all_best_tags
 
 
 # ====================================
-# 🔹 API /auto-tag
+# 🔹 API 1: /auto-tag (chỉ phân tích, chưa upload)
 # ====================================
 @app.route("/auto-tag", methods=["POST"])
 def auto_tag():
-    if not model:
-        return jsonify({"error": "Model YOLO chưa được tải!"}), 500
-    if not clip_model:
-        return jsonify({"error": "Model CLIP chưa được tải!"}), 500
+    if not model or not clip_model:
+        return jsonify({"error": "Model chưa được nạp!"}), 500
 
     files = request.files.getlist("files")
     if not files:
@@ -112,19 +144,17 @@ def auto_tag():
         if file.filename == "":
             continue
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            file.save(tmp.name)
-            image_path = tmp.name
+        tmp_name = f"{uuid.uuid4().hex}.jpg"
+        tmp_path = os.path.join(tempfile.gettempdir(), tmp_name)
+        file.save(tmp_path)
 
         print(f"\n🔍 Xử lý ảnh: {file.filename}")
 
         try:
-            # --- YOLO nhận dạng ---
-            results = model(image_path, conf=0.5)
+            results = model(tmp_path, conf=0.5)
             names = model.names
             detected_tags = set()
-
-            img = Image.open(image_path).convert("RGB")
+            img = Image.open(tmp_path).convert("RGB")
 
             for r in results:
                 if not r.boxes:
@@ -134,40 +164,36 @@ def auto_tag():
                     tag_name = names.get(cls_id, "unknown")
                     tag_vi = YOLO_TAGS_VI.get(tag_name, tag_name)
                     detected_tags.add(tag_vi)
-                    print(f"✅ Phát hiện: {tag_name} → {tag_vi}")
+                    print(f"✅ YOLO phát hiện: {tag_vi}")
 
             if not detected_tags:
                 detected_tags.add("không phát hiện sản phẩm")
 
-            # --- CLIP sinh mô tả ---
+            # CLIP sinh mô tả
             clip_tags = generate_clip_tags(img)
             detected_tags.update(clip_tags)
 
-            # --- Upload lên Cloudinary ---
-            cloud_url = upload_to_cloudinary(image_path, list(detected_tags))
-
-            # --- Kết quả ---
+            # Không upload — chỉ trả về path tạm
             results_all.append({
                 "filename": file.filename,
                 "tags": list(detected_tags),
-                "cloud_url": cloud_url
+                "temp_path": tmp_path
             })
 
         except Exception as e:
-            print(f"❌ Lỗi khi xử lý {file.filename}: {e}")
+            print(f"❌ Lỗi xử lý {file.filename}: {e}")
             results_all.append({
                 "filename": file.filename,
                 "tags": ["Lỗi xử lý ảnh"],
-                "cloud_url": None
+                "temp_path": None
             })
 
-        finally:
-            if os.path.exists(image_path):
-                os.remove(image_path)
-
-    print("\n🎯 Kết quả cuối cùng:", results_all)
     return jsonify({"results": results_all})
 
+
+# ====================================
+# 🔹 API 2: /upload-cloud (khi nhấn Lưu)
+# ====================================
 
 if __name__ == "__main__":
     app.run(debug=True, port=5001)
